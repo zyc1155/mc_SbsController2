@@ -17,34 +17,18 @@ SbsControllerZyc::SbsControllerZyc(mc_rbdyn::RobotModulePtr rm, double dt, const
     joint_name = {"LCY", "LCR", "LCP", "LKP", "LAP", "LAR", "RCY", "RCR", "RCP", "RKP", "RAP", "RAR"};
     sensornames = {"LeftFootForceSensor", "RightFootForceSensor"};
 
-    std::vector<tasks::qp::JointStiffness> stiffnesses;
-
-    for (int i = 0; i < 12; i++)
-    {
-        stiffnesses.push_back({joint_name[i], 1.0});
-    }
-    postureTask->jointStiffness(solver(), stiffnesses);
-
     Eigen::VectorXd ww(59);
-    ww.head(18) = Eigen::MatrixXd::Constant(18, 1, 0.001);
-    ww.tail(41) = Eigen::MatrixXd::Constant(41, 1, 1000.0);
-
-    // Eigen::VectorXd ww(59);
-    // ww.head(6) = Eigen::MatrixXd::Constant(6, 1, 0.001);
-    // ww.tail(53) = Eigen::MatrixXd::Constant(53, 1, 1000.0);
+    ww.head(6) = Eigen::MatrixXd::Constant(6, 1, 0.001);
+    ww.tail(53) = Eigen::MatrixXd::Constant(53, 1, 1000.0);
 
     postureTask->dimWeight(ww);
-
-    comTask = std::make_shared<mc_tasks::CoMTask>(robots(), 0, 100.0, 1000.0);
-    solver().addTask(comTask);
-
-    addContact({robot().name(), "ground", "LeftFoot", "AllGround"});
-    addContact({robot().name(), "ground", "RightFoot", "AllGround"});
 
     first = true;
 
     ctrl_mode = 0;
     ctrl_mode2 = 0;
+
+    zyc_duration = 0;
 
     omega = sqrt(GRAVITY / HEIGHTREF);
     COMShifter_Kp = Eigen::Matrix3d::Zero();
@@ -52,7 +36,7 @@ SbsControllerZyc::SbsControllerZyc(mc_rbdyn::RobotModulePtr rm, double dt, const
 
     for (int i = 0; i < 3; i++)
     {
-        COMShifter_Kp(i, i) = 70.0;
+        COMShifter_Kp(i, i) = 20.0;
 
         COMShifter_Kd(i, i) = COMShifter_Kp(i, i) / omega + omega;
     }
@@ -62,47 +46,53 @@ SbsControllerZyc::SbsControllerZyc(mc_rbdyn::RobotModulePtr rm, double dt, const
 
     posRA = Eigen::Vector3d::Zero();
     posRB = Eigen::Vector3d::Zero();
-    thetad = Eigen::Matrix<double, NUMJOINTS, 1>::Zero();
 
     cas_mem = casadi_alloc(h_functions());
-
-    arg_ = theta.data();
+    arg_ = realState.theta.data();
     *(cas_mem->arg) = arg_;
-
     cas_mem->res = new double *[cas_mem->sz_res];
 
-    cas_mem->res[0] = A_R_H.data();
-    cas_mem->res[1] = A_R_B.data();
-    cas_mem->res[2] = A_p_BA.data();
-    cas_mem->res[3] = A_p_GA.data();
-    cas_mem->res[4] = A_J_wHA.data();
-    cas_mem->res[5] = A_J_wBA.data();
-    cas_mem->res[6] = A_J_pBA.data();//fuck_B[0];//A_J_pBA_.data();
-    cas_mem->res[7] = A_J_pGA.data();//fuck_G[0];//A_J_pGA_.data();
+    cas_mem->res[0] = realState.A_R_H.data();
+    cas_mem->res[1] = realState.A_R_B.data();
+    cas_mem->res[2] = realState.A_p_BA.data();
+    cas_mem->res[3] = realState.A_p_GA.data();
+    cas_mem->res[4] = realState.A_J_wHA.data();
+    cas_mem->res[5] = realState.A_J_wBA.data();
+    cas_mem->res[6] = realState.A_J_pBA.data();
+    cas_mem->res[7] = realState.A_J_pGA.data();
+
+    cas_memd = casadi_alloc(h_functions());
+    arg_ = controlState.theta.data();
+    *(cas_memd->arg) = arg_;
+    cas_memd->res = new double *[cas_memd->sz_res];
+
+    cas_memd->res[0] = controlState.A_R_H.data();
+    cas_memd->res[1] = controlState.A_R_B.data();
+    cas_memd->res[2] = controlState.A_p_BA.data();
+    cas_memd->res[3] = controlState.A_p_GA.data();
+    cas_memd->res[4] = controlState.A_J_wHA.data();
+    cas_memd->res[5] = controlState.A_J_wBA.data();
+    cas_memd->res[6] = controlState.A_J_pBA.data();
+    cas_memd->res[7] = controlState.A_J_pGA.data();
 
     createGUI();
 
     gui()->addElement({"a"},
-                      mc_rtc::gui::Point3D("A_p_GA", [this]()
-                                           { return A_p_GA; }),
-                      mc_rtc::gui::Point3D("COM", [this]()
-                                           { 
-                                            Eigen::Vector3d W_p_GW;
-                                            W_p_GW =  W_p_AW + W_R_A * A_p_GA;
-                                            return W_p_GW; }),
-                      mc_rtc::gui::Point3D("COM real", [this]()
-                                           { return real_COM; }),
-                      mc_rtc::gui::Point3D("right foot", [this]()
-                                           { 
-                                            Eigen::Vector3d W_p_BW;
-                                            W_p_BW =  W_p_AW + W_R_A * A_p_BA;
-                                            return W_p_BW; }),
-                      mc_rtc::gui::Point3D("right foot real", [this]()
-                                           { return real_rfoot; }),
-                      mc_rtc::gui::Rotation("body", [this]()
-                                            { return sva::PTransformd{W_R_A * A_R_H, Eigen::Vector3d::Zero()}; }));
+                      mc_rtc::gui::Point3D("ZMP", [this]()
+                                           { return realState.W_Q_W; }));
 
-    fp = fopen("/home/zyc/data.csv", "w");
+    logger().addLogEntries(
+        this,
+        "COM_real", [this]()
+        { return real_COM; },
+        "COM_output", [this]()
+        { return out_COM; },
+        "COM_ref", [this]()
+        { return ref_COM; },
+        "ZMP", [this]()
+        { return realState.W_Q_W; });
+
+    //fp = fopen("/home/zyc/data.csv", "w");
 
     mc_rtc::log::success("SbsControllerZyc init done ");
 }
@@ -115,41 +105,18 @@ bool SbsControllerZyc::run()
     }
     ttime = std::chrono::duration<double>(std::chrono::high_resolution_clock::now() - start_time).count();
 
-    if (rightFootLift_)
-    {
-        removeContact({robot().name(), "ground", "RightFoot", "AllGround"});
-        removeContact({robot().name(), "ground", "LeftFoot", "AllGround"});
-        solver().removeTask(comTask);
-
-        std::vector<tasks::qp::JointStiffness> stiffnesses;
-
-        for (int i = 0; i < 12; i++)
-        {
-            stiffnesses.push_back({joint_name[i], 100.0});
-        }
-        postureTask->jointStiffness(solver(), stiffnesses);
-
-        Eigen::VectorXd ww(59);
-        ww.head(6) = Eigen::MatrixXd::Constant(6, 1, 0.001);
-        ww.tail(53) = Eigen::MatrixXd::Constant(53, 1, 1000.0);
-
-        thetad = theta;
-
-        rightFootLift_ = false;
-        haha = true;
-    }
-
     get_angles();
     set_CtrlPos();
-    state_swiching();
     set_Jacobian();
+    state_swiching();
     set_desiredVel();
     cal_thetad();
     set_angles();
-    output_data();
+    //output_data();
 
     if (first)
         first = false;
+
 
     return mc_control::MCController::run();
 }
@@ -166,7 +133,11 @@ void SbsControllerZyc::get_angles()
     for (int i = 0; i < 12; i++)
     {
         Joint_Index = robot().jointIndexByName(joint_name[i]);
-        theta(i) = realRobot().q()[Joint_Index][0];
+        realState.theta(i) = realRobot().q()[Joint_Index][0];
+    }
+    if (first)
+    {
+        controlState.theta = realState.theta;
     }
 
     left = realRobot().surfaceWrench("LeftFootCenter");
@@ -175,19 +146,21 @@ void SbsControllerZyc::get_angles()
     world_wrench = realRobot().netWrench(sensornames);
 
     if (world_wrench.force()[2] > 1.0)
-        W_Q_W = realRobot().zmp(world_wrench, ZMP_frame);
+        realState.W_Q_W = realRobot().zmp(world_wrench, ZMP_frame);
 
-    A_f_A = left.force();
-    A_n_A = left.moment();
+    realState.A_f_A = left.force();
+    realState.A_n_A = left.moment();
 
-    B_f_B = right.force();
-    B_n_B = right.moment();
+    realState.B_f_B = right.force();
+    realState.B_n_B = right.moment();
 
     W_R_A = realRobot().surfacePose("LeftFootCenter").rotation();
     W_p_AW = realRobot().surfacePose("LeftFootCenter").translation();
 
     real_COM = realRobot().com();
     real_rfoot = realRobot().surfacePose("RightFootCenter").translation();
+
+    out_COM = robot().com();
 }
 
 void SbsControllerZyc::set_CtrlPos()
@@ -205,10 +178,10 @@ void SbsControllerZyc::set_CtrlPos()
     // else
     //   posRB << .0,.0,0.01;
 
-    // if (rightFootLift_)
-    // {
-    //     posRB << .0, .0, .01;
-    // }
+    if (rightFootLift_)
+    {
+        posRB << .0, .0, .01;
+    }
 
     if (first)
     {
@@ -223,23 +196,63 @@ void SbsControllerZyc::set_CtrlPos()
     posRBp = posRB;
 }
 
+void SbsControllerZyc::set_Jacobian()
+{
+    casadi_eval(cas_mem);
+    casadi_eval(cas_memd);
+
+    if (ctrl_mode2 == 0)
+    {
+        if (first)
+        {
+            realState.A_p_GAp = realState.A_p_GA;
+            controlState.A_p_GAp = controlState.A_p_GA;
+        }
+
+        realState.A_v_GA = (realState.A_p_GA - realState.A_p_GAp) / timeStep;
+        controlState.A_v_GA = (controlState.A_p_GA - controlState.A_p_GAp) / timeStep;
+
+        if (first)
+        {
+            realState.A_v_GAp = realState.A_v_GA;
+            controlState.A_v_GAp = controlState.A_v_GA;
+        }
+
+        realState.A_a_GA = (realState.A_v_GA - realState.A_v_GAp) / timeStep;
+        controlState.A_a_GA = (controlState.A_v_GA - controlState.A_v_GAp) / timeStep;
+
+        realState.A_p_GAp = realState.A_p_GA;
+        realState.A_v_GAp = realState.A_v_GA;
+
+        controlState.A_p_GAp = controlState.A_p_GA;
+        controlState.A_v_GAp = controlState.A_v_GA;
+
+        realState.Q_ep = realState.A_p_GA - realState.A_a_GA / (omega * omega);
+        realState.Q_ep(2) = realState.Q_ep(2) - HEIGHTREF;
+
+        controlState.Q_ep = controlState.A_p_GA - controlState.A_a_GA / (omega * omega);
+        controlState.Q_ep(2) = controlState.Q_ep(2) - HEIGHTREF;
+    }
+}
+
 void SbsControllerZyc::state_swiching()
 {
     if (ctrl_mode == 1)
     {
         ctrl_mode2 = 0;
-        if (fabs(Q_ep(0)) < 0.08 && fabs(Q_ep(1)) < 0.04)
+        if (fabs(realState.Q_ep(0)) < 0.08 && fabs(realState.Q_ep(1)) < 0.04)
         {
-            ctrl_mode = 2;
-            timer_mode = 0.0;
-            leftFootRatio = 1.0;
+            // ctrl_mode = 2;
+            // timer_mode = 0.0;
+            // leftFootRatio = 1.0;
         }
     }
     else if (ctrl_mode == 2)
     {
         ctrl_mode2 = 0;
         timer_mode += timeStep;
-        if ((timer_mode > 0.1) && B_f_B(2) > 1e-1)
+        timer_mode = 0;
+        if ((timer_mode > 0.1) && realState.B_f_B(2) > 1e-1)
         {
             ctrl_mode = 0;
             leftFootRatio = 0.5;
@@ -248,7 +261,7 @@ void SbsControllerZyc::state_swiching()
     else if (ctrl_mode == 5)
     {
         ctrl_mode2 = 1;
-        if (fabs(Q_ep(0)) < 0.08 && fabs(Q_ep(1)) < 0.04)
+        if (fabs(controlState.Q_ep(0)) < 0.08 && fabs(controlState.Q_ep(1)) < 0.04)
         {
             ctrl_mode = 6;
             timer_mode = 0.0;
@@ -259,7 +272,7 @@ void SbsControllerZyc::state_swiching()
     {
         ctrl_mode2 = 1;
         timer_mode += timeStep;
-        if ((timer_mode > 0.1) && A_f_A(2) > 1e-1)
+        if ((timer_mode > 0.1) && realState.A_f_A(2) > 1e-1)
         {
             ctrl_mode = 0;
             leftFootRatio = 0.5;
@@ -269,18 +282,18 @@ void SbsControllerZyc::state_swiching()
     {
         if (ctrl_mode2 == 1)
         {
-            A_v_GAd = A_R_B * B_v_GBd;
-            A_p_GAp = A_R_B * (B_p_GBp - B_p_ABp);
-            A_p_GA_ref = A_R_B * (B_p_GB_ref - B_p_AB);
+            // A_v_GAd = A_R_B * B_v_GBd;
+            // A_p_GAp = A_R_B * (B_p_GBp - B_p_ABp);
+            // A_p_GA_ref = A_R_B * (B_p_GB_ref - B_p_AB);
 
-            cas_mem->res[0] = A_R_H_.data();
-            cas_mem->res[1] = A_R_B_.data();
-            cas_mem->res[2] = A_p_BA.data();
-            cas_mem->res[3] = A_p_GA.data();
-            cas_mem->res[4] = A_J_wHA_.data();
-            cas_mem->res[5] = A_J_wBA_.data();
-            cas_mem->res[6] = A_J_pBA_.data();
-            cas_mem->res[7] = A_J_pGA_.data();
+            // cas_mem->res[0] = A_R_H.data();
+            // cas_mem->res[1] = A_R_B.data();
+            // cas_mem->res[2] = A_p_BA.data();
+            // cas_mem->res[3] = A_p_GA.data();
+            // cas_mem->res[4] = A_J_wHA.data();
+            // cas_mem->res[5] = A_J_wBA.data();
+            // cas_mem->res[6] = A_J_pBA.data();
+            // cas_mem->res[7] = A_J_pGA.data();
         }
 
         ctrl_mode2 = 0;
@@ -290,37 +303,13 @@ void SbsControllerZyc::state_swiching()
     {
         if (ctrl_mode2 == 0)
         {
-            B_v_GBd = B_R_A * A_v_GAd;
-            B_p_GBp = B_R_A * (A_p_GAp - A_p_BAp);
-            B_p_GB_ref = B_R_A * (A_p_GA_ref - A_p_BA);
+            // B_v_GBd = B_R_A * A_v_GAd;
+            // B_p_GBp = B_R_A * (A_p_GAp - A_p_BAp);
+            // B_p_GB_ref = B_R_A * (A_p_GA_ref - A_p_BA);
         }
 
         ctrl_mode2 = 1;
         ctrl_mode = 5;
-    }
-}
-
-void SbsControllerZyc::set_Jacobian()
-{
-    casadi_eval(cas_mem);
-    if (ctrl_mode2 == 0)
-    {
-        // A_R_H = A_R_H_;
-        // A_R_B = A_R_B_;
-        // A_J_wHA = A_J_wHA_;
-        // A_J_wBA = A_J_wBA_;
-        //A_J_pBA = A_J_pBA_;
-        //A_J_pGA = A_J_pGA_;
-
-        // for(int i=0;i<3;i++)
-        // {
-        //     for(int j=0;j<12;j++)
-        //     {
-        //         A_J_pBA(i,j)=fuck_B[i][j];
-        //         A_J_pGA(i,j)=fuck_G[i][j];
-        //     }
-        // }
-
     }
 }
 
@@ -330,41 +319,41 @@ void SbsControllerZyc::set_desiredVel()
     {
         if (ctrl_mode2 == 0)
         {
-            Q_ref = A_p_BA / 2.0;
+            Q_ref = realState.A_p_BA / 2.0;
         }
         else
         {
-            Q_ref = B_p_AB / 2.0;
+            Q_ref = realState.B_p_AB / 2.0;
         }
     }
     else
     {
         Q_ref = Eigen::Vector3d::Zero();
+        Q_ref(1) = -0.045;
     }
 
     Q_ref(2) += HEIGHTREF;
 
-    Q_ref << 0.0, -0.105, 0.9;
-
     if (first)
     {
-        A_p_GA_ref = A_p_GA;
+        A_p_GA_ref = realState.A_p_GA;
+        A_v_GAd = realState.A_v_GA;
     }
 
     if (ctrl_mode2 == 0)
     {
 
-        // A_a_GAd = sat_func(A_LIM, COMShifter_Kp * (Q_ref - A_p_GA_ref) - COMShifter_Kd * A_v_GAd);
+        A_a_GAd = sat_func(A_LIM, COMShifter_Kp * (Q_ref - A_p_GA_ref) - COMShifter_Kd * A_v_GAd);
+        A_v_GAd += A_a_GAd * timeStep;
+        //A_v_GAdd = 0.1 * (A_p_GA_ref - realState.A_p_GA) - 0.1 * realState.A_v_GA;
+        A_p_GA_ref += A_v_GAd * timeStep;
 
-        // A_v_GAd += A_a_GAd * timeStep;
+        A_v_GAdd = realState.A_v_GA + (10.0 * (A_p_GA_ref - realState.A_p_GA) - 5.0 * realState.A_v_GA) * timeStep;
+        // A_a_GAd = Eigen::Vector3d::Zero();
+        // A_v_GAd = sat_func(0.1, 1.0 * (Q_ref - realState.A_p_GA));
         // A_p_GA_ref += A_v_GAd * timeStep;
 
-        A_a_GAd = Eigen::Vector3d::Zero();
-        A_v_GAd = sat_func(0.1, 1.0 * (Q_ref - A_p_GA));
-
-        Q_ep = A_p_GA - A_a_GAd / (omega * omega);
-        // Q_ep = A_p_GA ;
-        Q_ep(2) = Q_ep(2) - HEIGHTREF;
+        ref_COM = realRobot().surfacePose("LeftFootCenter").translation() + realRobot().surfacePose("LeftFootCenter").rotation() * A_p_GA_ref;
     }
     else if (ctrl_mode2 == 1)
     {
@@ -373,8 +362,6 @@ void SbsControllerZyc::set_desiredVel()
         B_v_GBd += B_a_GBd * timeStep;
         B_p_GB_ref += B_v_GBd * timeStep;
 
-        Q_ep = B_p_GB - B_a_GBd / (omega * omega);
-        Q_ep(2) = Q_ep(2) - HEIGHTREF;
     }
 
     if ((ctrl_mode == 0 || ctrl_mode == 1 || ctrl_mode == 5))
@@ -386,50 +373,53 @@ void SbsControllerZyc::set_desiredVel()
 
         if (ctrl_mode2 == 0)
         {
-            A_p_BA_ref(0) = posRB(0) * 3.0;
-            A_p_BA_ref(1) = -0.11 + posRB(1) * 2.0;
-            A_p_BA_ref(2) = posRB(2) * 1.7;
+            A_p_BA_ref(0) = posRB(0) * 10.0;
+            A_p_BA_ref(1) = -0.21 + posRB(1) * 5.0;
+            A_p_BA_ref(2) = posRB(2) * 8.0;
 
             A_R_H_ref = Eigen::Matrix3d::Identity();
-            A_w_Hd = cal_Dangvel_InR(A_R_H_ref, A_R_H);
+            A_w_Hd = cal_Dangvel_InR(A_R_H_ref, realState.A_R_H);
+
+            //A_v_GAdd = 0.1 * (A_p_GA_ref - realState.A_p_GA) - 0.1 * realState.A_v_GA;
         }
         else
         {
-            B_p_AB_ref(0) = posRA(0) * 3.0;
-            B_p_AB_ref(1) = 0.11 + posRA(1) * 2.0;
-            B_p_AB_ref(2) = posRA(2) * 1.7;
+            B_p_AB_ref(0) = posRA(0) * 10.0;
+            B_p_AB_ref(1) = 0.21 + posRA(1) * 5.0;
+            B_p_AB_ref(2) = posRA(2) * 8.0;
 
             B_R_H_ref == Eigen::Matrix3d::Identity();
-            B_w_Hd = cal_Dangvel_InR(B_R_H_ref, B_R_H);
+            B_w_Hd = cal_Dangvel_InR(B_R_H_ref, realState.B_R_H);
         }
     }
     else if (ctrl_mode2 == 0)
     {
-        A_p_BA_ref(0) = posRB(0) * 3.0;
-        A_p_BA_ref(1) = -0.21 + posRB(1) * 2.0;
-        A_p_BA_ref(2) = posRB(2) * 1.7;
+        A_p_BA_ref(0) = posRB(0) * 10.0;
+        A_p_BA_ref(1) = -0.21 + posRB(1) * 5.0;
+        A_p_BA_ref(2) = posRB(2) * 8.0;
 
         double PRL = 5.0, DRL = 0.3;
-        A_v_BAd = sat_func(0.15, PRL * (A_p_BA_ref - A_p_BA));
+        A_v_BAd = sat_func(0.15, PRL * (A_p_BA_ref - realState.A_p_BA));
 
         A_w_Hd = Eigen::Vector3d::Zero();
 
         A_R_B_ref = Eigen::Matrix3d::Identity();
-        A_w_Bd = cal_Dangvel_InR(A_R_B_ref, A_R_B);
+        A_w_Bd = cal_Dangvel_InR(A_R_B_ref, realState.A_R_B);
+        //A_v_GAdd = 0.5 * (A_p_GA_ref - realState.A_p_GA) - 0.5 * realState.A_v_GA;
     }
     else
     {
-        B_p_AB_ref(0) = posRA(0) * 3.0;
-        B_p_AB_ref(1) = 0.21 + posRA(1) * 2.0;
-        B_p_AB_ref(2) = posRA(2) * 1.7;
+        B_p_AB_ref(0) = posRA(0) * 10.0;
+        B_p_AB_ref(1) = 0.21 + posRA(1) * 5.0;
+        B_p_AB_ref(2) = posRA(2) * 8.0;
 
         double PRL = 10.0, DRL = 0.3;
-        B_v_ABd = sat_func(0.5, PRL * (B_p_AB_ref - B_p_AB));
+        B_v_ABd = sat_func(0.5, PRL * (B_p_AB_ref - realState.B_p_AB));
 
         B_w_Hd = Eigen::Vector3d::Zero();
 
         B_R_A_ref = Eigen::Matrix3d::Identity();
-        B_w_Ad = cal_Dangvel_InR(B_R_A_ref, B_R_A);
+        B_w_Ad = cal_Dangvel_InR(B_R_A_ref, realState.B_R_A);
     }
 }
 
@@ -438,33 +428,28 @@ void SbsControllerZyc::cal_thetad()
     Eigen::Matrix<double, 12, NUMJOINTS> JJ;
     Eigen::Matrix<double, 12, 1> vdd;
 
-    JJ << A_J_pGA, A_J_pBA, A_J_wHA, A_J_wBA;
+    
+    JJ << controlState.A_J_pGA, controlState.A_J_pBA, controlState.A_J_wHA, controlState.A_J_wBA;
+    //JJ << realState.A_J_pGA, realState.A_J_pBA, realState.A_J_wHA, realState.A_J_wBA;
     vdd << A_v_GAd, A_v_BAd, A_w_Hd, A_w_Bd;
-    //vdd << A_v_GAd, Eigen::Matrix<double, 9, 1>::Zero();
 
-    theta_dotd = JJ.colPivHouseholderQr().solve(vdd);
+    controlState.theta_dot = JJ.colPivHouseholderQr().solve(vdd);
+
+    // JJ << realState.A_J_pGA, realState.A_J_pBA, realState.A_J_wHA, realState.A_J_wBA;
+    // vdd << A_v_GAdd, Eigen::Matrix<double, 9, 1>::Zero();
+
+    
     // theta_dotd=Matrix<double, 11, 1>::Zero();
 
-    if (first)
-    {
-        thetad = theta;
-    }
-
-    thetadp = thetad;
-    thetad += theta_dotd * timeStep;
+    controlState.thetap = controlState.theta;
+    controlState.theta += (controlState.theta_dot) * timeStep; //+ JJ.colPivHouseholderQr().solve(vdd)
 }
 
 void SbsControllerZyc::set_angles()
 {
-    int Joint_Index;
     for (int i = 0; i < 12; i++)
     {
-        Joint_Index = robot().jointIndexByName(joint_name[i]);
-
-        if (haha)
-            postureTask->target({{joint_name[i], {thetad(i)}}});
-        else
-            postureTask->target({{joint_name[i], robot().q()[Joint_Index]}});
+        postureTask->target({{joint_name[i], {controlState.theta(i)}}});
     }
 }
 
@@ -477,14 +462,22 @@ void SbsControllerZyc::output_data()
 
     for (int i = 0; i < 3; i++)
         fprintf(fp, ",%.6lf", Q_ref(i));
-   
-    fprintf(fp, ",");
-    for (int i = 0; i < 3; i++)
-        fprintf(fp, ",%.6lf", A_p_GA(i));
 
     fprintf(fp, ",");
     for (int i = 0; i < 3; i++)
-        fprintf(fp, ",%.6lf", A_p_BA(i));
+        fprintf(fp, ",%.6lf", A_p_GA_ref(i));
+
+    fprintf(fp, ",");
+    for (int i = 0; i < 3; i++)
+        fprintf(fp, ",%.6lf", realState.A_p_GA(i));
+
+    // fprintf(fp, ",");
+    // for (int i = 0; i < 3; i++)
+    //     fprintf(fp, ",%.6lf", A_p_BA_ref(i));
+
+    // fprintf(fp, ",");
+    // for (int i = 0; i < 3; i++)
+    //     fprintf(fp, ",%.6lf", A_p_BA(i));
 
     fprintf(fp, "\n");
     fflush(fp);
